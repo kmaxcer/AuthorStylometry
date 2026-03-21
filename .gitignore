@@ -1,0 +1,13 @@
+data/raw/
+data/processed/
+data/windows/
+data/datasets/
+models_saved/
+
+__pycache__/
+*.pyc
+.idea/
+*.iml
+
+.DS_Store
+Thumbs.db
