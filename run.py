@@ -7,7 +7,6 @@ import argparse
 import sys
 from pathlib import Path
 
-# Добавляем src в путь для импортов
 sys.path.insert(0, str(Path(__file__).parent / 'src'))
 
 
