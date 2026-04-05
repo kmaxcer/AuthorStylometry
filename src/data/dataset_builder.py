@@ -3,154 +3,177 @@
 """
 
 import json
-import numpy as np
+import logging
 from pathlib import Path
 from collections import Counter
+from typing import List, Tuple, Dict
 
-from src.data.loader import load_all_windows
-from src.data.splitter import split_by_works
+import numpy as np
+
+from loader import load_all_windows
+from splitter import split_by_works
 from src.features.base_features import BaseFeatureExtractor
 from src.features.ngram_features import NgramExtractor
+from src.features.pos_features import PosFeatureExtractor
+
+logger = logging.getLogger(__name__)
 
 
 class DatasetBuilder:
-    def __init__(self, window_size: int = 1000):
+    def __init__(self, window_size: int = 1000, ngram_n: int = 3, ngram_top_k: int = 500,
+                 nn_vocab_size: int = 10000, use_pos: bool = True):
         self.window_size = window_size
+        self.nn_vocab_size = nn_vocab_size
+        self.use_pos = use_pos
         self.base_dir = Path(__file__).resolve().parent.parent.parent
         self.windows_dir = self.base_dir / 'data' / 'windows'
         self.datasets_dir = self.base_dir / 'data' / 'datasets'
-        self.author_to_label = {}
-        self.label_to_author = {}
 
         self.base_extractor = BaseFeatureExtractor()
-        self.ngram_extractor = NgramExtractor(n=3, top_k=500)
+        self.ngram_extractor = NgramExtractor(n=ngram_n, top_k=ngram_top_k)
+        self.pos_extractor = PosFeatureExtractor() if use_pos else None
 
-    def _get_author_labels(self, authors: List[str]):
-        unique_authors = sorted(set(authors))
-        self.author_to_label = {author: idx for idx, author in enumerate(unique_authors)}
-        self.label_to_author = {idx: author for author, idx in self.author_to_label.items()}
+    def _get_author_labels(self, authors: List[str]) -> Tuple[Dict[str, int], Dict[int, str]]:
+        unique = sorted(set(authors))
+        author_to_label = {a: i for i, a in enumerate(unique)}
+        label_to_author = {i: a for a, i in author_to_label.items()}
+        logger.info("Найдено авторов: %d (%s)", len(unique), ', '.join(unique))
+        return author_to_label, label_to_author
 
-    def _build_ngram_vocab(self, texts: List[str]):
-        self.ngram_extractor.build_vocab(texts)
+    def _build_feature_names(self) -> List[str]:
+        base_names = self.base_extractor.get_feature_names()
+        ngram_names = [f'ngram_{ng}' for ng in self.ngram_extractor.vocab]
+        names = base_names + ngram_names
+        if self.pos_extractor:
+            names += self.pos_extractor.get_feature_names()
+        return names
 
-    def _extract_ml_features(self, text: str) -> List[float]:
+    def _extract_ml_features(self, text: str) -> np.ndarray:
         base = self.base_extractor.extract(text)
         ngrams = self.ngram_extractor.extract(text)
-        return base + ngrams
+        parts = [base, ngrams]
+        if self.pos_extractor:
+            parts.append(self.pos_extractor.extract(text))
+        return np.concatenate([np.array(p, dtype=np.float32) for p in parts])
 
-    def _create_ml_dataset(self, texts: List[str], labels: List[int], output_dir: Path):
-        X = [self._extract_ml_features(t) for t in texts]
-        X = np.array(X)
-        y = np.array(labels)
+    def _encode_nn_sequences(self, texts: List[str], char_to_idx: Dict[str, int]) -> np.ndarray:
+        sequences = []
+        for text in texts:
+            seq = [char_to_idx.get(c, 1) for c in text[:self.window_size]]
+            pad_len = self.window_size - len(seq)
+            if pad_len > 0:
+                seq.extend([0] * pad_len)
+            sequences.append(seq)
+        return np.array(sequences, dtype=np.int32)
 
-        ml_dir = output_dir / 'ml'
-        ml_dir.mkdir(parents=True, exist_ok=True)
-
-        np.save(ml_dir / 'X.npy', X)
-        np.save(ml_dir / 'y.npy', y)
-
-        feature_names = [
-            'word_count', 'char_count', 'sentence_count', 'avg_word_length', 'avg_sentence_length',
-            'type_token_ratio', 'hapax_ratio',
-            'punct_dot', 'punct_comma', 'punct_exclam', 'punct_quest', 'punct_colon', 'punct_semicolon',
-            'punct_hyphen', 'punct_dash', 'punct_ellipsis', 'punct_quote', 'punct_lparen', 'punct_rparen',
-            'punct_lfquote', 'punct_rfquote', 'punct_apostrophe', 'punct_density',
-            'stopword_and', 'stopword_v', 'stopword_ne', 'stopword_na', 'stopword_ya',
-            'stopword_chto', 'stopword_on', 'stopword_s', 'stopword_a', 'stopword_k',
-            'freq_o', 'freq_e', 'freq_a', 'freq_i', 'freq_n', 'freq_t', 'freq_s', 'freq_r', 'freq_v', 'freq_l',
-            'upper_ratio', 'digit_ratio', 'dialogue_dashes', 'word_length_std', 'punct_diversity'
-        ]
-        for i in range(len(self.ngram_extractor.vocab)):
-            feature_names.append(f'ngram_{self.ngram_extractor.vocab[i]}')
-
-        with open(ml_dir / 'feature_names.json', 'w', encoding='utf-8') as f:
-            json.dump(feature_names, f, ensure_ascii=False, indent=2)
-
-    def _create_nn_dataset(self, texts: List[str], labels: List[int], output_dir: Path, vocab_size: int = 10000):
+    def _build_char_vocab(self, texts: List[str]) -> Dict[str, int]:
         char_counts = Counter()
         for text in texts:
             char_counts.update(text)
 
-        most_common = char_counts.most_common(vocab_size - 2)
+        most_common = char_counts.most_common(self.nn_vocab_size - 2)
         char_to_idx = {'<PAD>': 0, '<UNK>': 1}
         for char, _ in most_common:
             char_to_idx[char] = len(char_to_idx)
 
-        sequences = []
-        for text in texts:
-            seq = [char_to_idx.get(c, 1) for c in text[:self.window_size]]
-            if len(seq) < self.window_size:
-                seq.extend([0] * (self.window_size - len(seq)))
-            sequences.append(seq)
+        logger.info("Символьный словарь: %d символов", len(char_to_idx))
+        return char_to_idx
 
-        X = np.array(sequences, dtype=np.int32)
-        y = np.array(labels)
+    def _save_ml_dataset(self, X_train: np.ndarray, y_train: np.ndarray,
+                         X_test: np.ndarray, y_test: np.ndarray,
+                         feature_names: List[str]):
+        ml_dir = self.datasets_dir / 'ml'
+        ml_dir.mkdir(parents=True, exist_ok=True)
 
-        nn_dir = output_dir / 'nn'
+        np.save(ml_dir / 'X.npy', X_train)
+        np.save(ml_dir / 'y.npy', y_train)
+        np.save(ml_dir / 'X_test.npy', X_test)
+        np.save(ml_dir / 'y_test.npy', y_test)
+
+        with open(ml_dir / 'feature_names.json', 'w', encoding='utf-8') as f:
+            json.dump(feature_names, f, ensure_ascii=False, indent=2)
+
+        logger.info("ML датасет: train %s, test %s, признаков %d",
+                     X_train.shape, X_test.shape, X_train.shape[1])
+
+    def _save_nn_dataset(self, X_train: np.ndarray, y_train: np.ndarray,
+                         X_test: np.ndarray, y_test: np.ndarray,
+                         char_to_idx: Dict[str, int]):
+        nn_dir = self.datasets_dir / 'nn'
         nn_dir.mkdir(parents=True, exist_ok=True)
 
-        np.save(nn_dir / 'X_sequences.npy', X)
-        np.save(nn_dir / 'y_labels.npy', y)
+        np.save(nn_dir / 'X_sequences.npy', X_train)
+        np.save(nn_dir / 'y_labels.npy', y_train)
+        np.save(nn_dir / 'X_test_sequences.npy', X_test)
+        np.save(nn_dir / 'y_test_labels.npy', y_test)
 
         with open(nn_dir / 'char_to_idx.json', 'w', encoding='utf-8') as f:
             json.dump(char_to_idx, f, ensure_ascii=False, indent=2)
 
-    def run(self, test_ratio: float = 0.2):
+        logger.info("NN датасет: train %s, test %s, словарь %d",
+                     X_train.shape, X_test.shape, len(char_to_idx))
+
+    def _save_labels(self, author_to_label: Dict[str, int], label_to_author: Dict[int, str]):
+        self.datasets_dir.mkdir(parents=True, exist_ok=True)
+        path = self.datasets_dir / 'author_labels.json'
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({
+                'author_to_label': author_to_label,
+                'label_to_author': {str(k): v for k, v in label_to_author.items()},
+                'n_classes': len(author_to_label),
+            }, f, ensure_ascii=False, indent=2)
+
+    def run(self, test_ratio: float = 0.2) -> bool:
         texts, authors, file_ids = load_all_windows(self.windows_dir)
         if not texts:
+            logger.error("Окна не найдены в %s", self.windows_dir)
             return False
 
-        self._get_author_labels(authors)
+        author_to_label, label_to_author = self._get_author_labels(authors)
+        labels = np.array([author_to_label[a] for a in authors])
 
         train_idx, test_idx = split_by_works(file_ids, authors, test_ratio)
 
         train_texts = [texts[i] for i in train_idx]
-        train_authors = [authors[i] for i in train_idx]
+        train_labels = labels[train_idx]
         test_texts = [texts[i] for i in test_idx]
+        test_labels = labels[test_idx]
 
-        train_labels = [self.author_to_label[a] for a in train_authors]
-        test_labels = [self.author_to_label[a] for a in test_authors]
+        logger.info("Train: %d окон, Test: %d окон", len(train_texts), len(test_texts))
 
-        self.datasets_dir.mkdir(parents=True, exist_ok=True)
+        self._save_labels(author_to_label, label_to_author)
 
-        with open(self.datasets_dir / 'author_labels.json', 'w', encoding='utf-8') as f:
-            json.dump({
-                'author_to_label': self.author_to_label,
-                'label_to_author': self.label_to_author,
-                'n_classes': len(self.author_to_label)
-            }, f, ensure_ascii=False, indent=2)
+        self.ngram_extractor.build_vocab(train_texts)
 
-        self._build_ngram_vocab(train_texts)
+        if self.pos_extractor:
+            logger.info("Извлечение POS-признаков (pymorphy2)...")
 
-        self._create_ml_dataset(train_texts, train_labels, self.datasets_dir)
+        X_train_ml = np.array([self._extract_ml_features(t) for t in train_texts])
+        X_test_ml = np.array([self._extract_ml_features(t) for t in test_texts])
+        feature_names = self._build_feature_names()
 
-        ml_dir = self.datasets_dir / 'ml'
-        X_test = [self._extract_ml_features(t) for t in test_texts]
-        np.save(ml_dir / 'X_test.npy', np.array(X_test))
-        np.save(ml_dir / 'y_test.npy', np.array(test_labels))
+        if X_train_ml.shape[1] != len(feature_names):
+            logger.warning("Несовпадение: признаков %d, имён %d.",
+                           X_train_ml.shape[1], len(feature_names))
 
-        self._create_nn_dataset(train_texts, train_labels, self.datasets_dir)
+        self._save_ml_dataset(X_train_ml, train_labels, X_test_ml, test_labels, feature_names)
 
-        nn_dir = self.datasets_dir / 'nn'
-        with open(nn_dir / 'char_to_idx.json', 'r', encoding='utf-8') as f:
-            char_to_idx = json.load(f)
+        char_to_idx = self._build_char_vocab(train_texts)
+        X_train_nn = self._encode_nn_sequences(train_texts, char_to_idx)
+        X_test_nn = self._encode_nn_sequences(test_texts, char_to_idx)
 
-        test_sequences = []
-        for text in test_texts:
-            seq = [char_to_idx.get(c, 1) for c in text[:self.window_size]]
-            if len(seq) < self.window_size:
-                seq.extend([0] * (self.window_size - len(seq)))
-            test_sequences.append(seq)
+        self._save_nn_dataset(X_train_nn, train_labels, X_test_nn, test_labels, char_to_idx)
 
-        np.save(nn_dir / 'X_test_sequences.npy', np.array(test_sequences))
-        np.save(nn_dir / 'y_test_labels.npy', np.array(test_labels))
-
+        logger.info("Сборка датасетов завершена. Директория: %s", self.datasets_dir)
         return True
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     builder = DatasetBuilder(window_size=1000)
-    builder.run(test_ratio=0.2)
+    success = builder.run(test_ratio=0.2)
+    if not success:
+        raise SystemExit("Ошибка сборки датасетов")
 
 
 if __name__ == "__main__":

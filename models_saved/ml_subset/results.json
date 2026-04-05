@@ -1,11 +1,17 @@
 {
+  "logreg": {
+    "accuracy": 0.8869203329369798
+  },
   "random_forest": {
-    "accuracy": 0.818192627824019
+    "accuracy": 0.8145065398335315
   },
   "svm": {
-    "accuracy": 0.31807372175980975
+    "accuracy": 0.8938168846611177
   },
   "xgboost": {
-    "accuracy": 0.8853745541022592
+    "accuracy": 0.8959571938168847
+  },
+  "lightgbm": {
+    "accuracy": 0.8941736028537456
   }
 }
